@@ -1,8 +1,8 @@
 #!/usr/bin/env fish
 
 # 入力CSVファイルとoutput_dirのパスを設定
-set csv_file "APTOS_train-val_annotation.csv"
-set output_dir "/Volumes/Extreme SSD/aptos2025/APTOS_train-val/chunks"
+set csv_file "/home/jovyan/share/aptos2025/APTOS_train-val_annotation.csv"
+set output_dir "/home/jovyan/share/aptos2025/APTOS_train-val/chunks"
 ß
 # output_dirが存在しない場合は作成
 if not test -d $output_dir
@@ -18,7 +18,7 @@ tail -n +2 $csv_file | while read -l line
     set end_time $fields[3]
 
     # video_idからMP4ファイルのパスを構築
-    set video_path "/Volumes/Extreme SSD/aptos2025/APTOS_train-val/aptos_videos/$video_id.mp4"
+    set video_path "/home/jovyan/share/aptos2025/APTOS_train-val/aptos_videos/$video_id.mp4"
     
     # 出力ファイル名を構築
     set output_file "$output_dir/$video_id"_"$start_time"_"$end_time.mp4"

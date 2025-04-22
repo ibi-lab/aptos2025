@@ -9,14 +9,27 @@ import pandas as pd
 import cv2
 import torch
 import numpy as np
+from torchvision.transforms import Compose, Lambda
+# from pytorchvideo.data.encoded_video import EncodedVideo
+# from pytorchvideo.transforms import (
+#     ApplyTransformToKey,
+#     UniformTemporalSubsample,
+#     ShortSideScale,
+#     Normalize,
+# )
+from torchvision.transforms._transforms_video import (
+    CenterCropVideo,
+    NormalizeVideo,
+)
 from pytorchvideo.data.encoded_video import EncodedVideo
 from pytorchvideo.transforms import (
     ApplyTransformToKey,
-    UniformTemporalSubsample,
     ShortSideScale,
-    Normalize,
+    UniformTemporalSubsample,
+    UniformCropVideo
 )
-from torchvision.transforms import Compose
+from typing import Dict
+# from torchvision.transforms import Compose
 import logging
 
 # ロガーの設定
@@ -25,6 +38,31 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+alpha = 4
+
+class PackPathway(torch.nn.Module):
+    """
+    Transform for converting video frames as a list of tensors.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, frames: torch.Tensor):
+        fast_pathway = frames
+        # Perform temporal sampling from the fast pathway.
+        slow_pathway = torch.index_select(
+            frames,
+            1,
+            torch.linspace(
+                0, frames.shape[1] - 1, frames.shape[1] // alpha
+            ).long(),
+        )
+        frame_list = [slow_pathway, fast_pathway]
+        return frame_list
+
 
 class VideoProcessor:
     def __init__(self, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
@@ -46,11 +84,31 @@ class VideoProcessor:
 
     def _create_transform(self) -> Compose:
         """動画前処理用のtransform作成"""
-        return Compose([
-            UniformTemporalSubsample(32),
-            ShortSideScale(256),
-            Normalize((0.45, 0.45, 0.45), (0.225, 0.225, 0.225))
-        ])
+        # return Compose([
+        #     UniformTemporalSubsample(32),
+        #     ShortSideScale(256),
+        #     Normalize((0.45, 0.45, 0.45), (0.225, 0.225, 0.225))
+        # ])
+        side_size = 256
+        mean = [0.45, 0.45, 0.45]
+        std = [0.225, 0.225, 0.225]
+        crop_size = 256
+        num_frames = 32
+        return ApplyTransformToKey(
+            key="video",
+            transform=Compose(
+                [
+                    UniformTemporalSubsample(num_frames),
+                    Lambda(lambda x: x/255.0),
+                    NormalizeVideo(mean, std),
+                    ShortSideScale(
+                        size=side_size
+                    ),
+                    CenterCropVideo(crop_size),
+                    # PackPathway()
+                ]
+            ),
+        )
 
     def extract_video_segment(self, video_path: str, start_sec: float, end_sec: float, 
                             output_path: str) -> bool:
@@ -95,23 +153,38 @@ class VideoProcessor:
     def extract_features(self, video_path: str) -> np.ndarray:
         """動画から特徴量を抽出"""
         try:
+            logger.info(f"動画エンコード")
             video = EncodedVideo.from_path(video_path)
+            logger.info(f"クリップ取得")
             video_data = video.get_clip(0, video.duration)
-            video_tensor = video_data["video"]
-            
+            # logger.info(f"テンソル取得")
+            # video_tensor = video_data["video"]
+
+            # logger.info(f"テンソル変換")
             # [T, H, W, C] -> [C, T, H, W]に変換
-            video_tensor = video_tensor.permute(3, 0, 1, 2)
+            # video_tensor = video_tensor.permute(3, 0, 1, 2)
             # float32に変換し、[0-255]から[0-1]にスケール
-            video_tensor = video_tensor.float() / 255.0
-            
+            # video_tensor = video_tensor.float() / 255.0
+
+            logger.info(f"前処理")            
             # 前処理を適用
-            video_tensor = self.transform(video_tensor)
+            video_tensor = self.transform(video_data)
             # バッチ次元を追加
-            video_tensor = video_tensor.unsqueeze(0)
-            video_tensor = video_tensor.to(self.device)
+            # video_tensor = video_tensor.unsqueeze(0)
+            # video_tensor = video_tensor.to(self.device)
+
+            logger.info(f'video_tensor: {video_tensor["video"].cpu().numpy().shape}')
             
+            logger.info(f"inputs変換")            
+
+            inputs = video_tensor["video"]
+            inputs = [i.to(self.device)[None, ...] for i in inputs]
+            
+            logger.info(f"model実行")            
             with torch.no_grad():
-                features = self.model(video_tensor)
+                features = self.model(inputs)
+
+            logger.info(f"CPUモードへ切り替え")
                 
             return features.cpu().numpy()
 
@@ -215,13 +288,18 @@ def create_dataset(csv_path: str, video_dir: str, output_feature_dir: str, save_
             logger.warning(f"動画ファイルが見つかりません: {video_path}")
             continue
 
-        feature_path = os.path.join(output_feature_dir, f"{video_id}_{idx:04d}.npz")
+        feature_path = os.path.join(output_feature_dir, f"{video_id}_{start_time}_{end_time}.npz")
         logger.info(f"特徴量抽出中: {video_path}")
 
         # 特徴量の抽出
         features = processor.extract_features(video_path)
+
+        logger.info(f"特徴量抽出終了")
+        
         if features is not None:
             # 特徴量とphase_idを保存
+            logger.info(f"特徴量保存中: {feature_path}")
+
             np.savez(feature_path, features=features, phase_id=phase_id)
             logger.info(f"特徴量を保存: {feature_path}")
         else:
