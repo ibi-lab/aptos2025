@@ -1,4 +1,36 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+APTOSデータセット処理スクリプト
+
+このスクリプトは、手術フェーズ分類のための動画データの前処理と特徴量抽出を行います。
+
+主な機能:
+1. 動画セグメントの切り出し
+   - 長い手術動画から指定された時間区間を切り出し
+   - 各セグメントを個別のファイルとして保存
+
+2. 特徴量抽出
+   - 切り出された動画セグメントから特徴量を抽出
+   - 事前学習済みのSlowFast networkを使用
+   - 抽出された特徴量をPyTorchのデータセット形式で保存
+
+3. データセットの作成
+   - 特徴量とアノテーションを組み合わせてデータセットを作成
+   - トレーニング用とバリデーション用にデータを分割
+   - オプションで均等なクラス分布になるようにサンプリング
+
+使用方法:
+1. 動画セグメントの切り出し:
+   python datam.py extract-segments --csv-path annotations.csv --video-dir videos
+
+2. データセットの作成:
+   python datam.py create-dataset --csv-path annotations.csv --video-dir segments
+
+注意事項:
+- GPUが利用可能な場合は自動的に使用されます
+- 大容量のメモリが必要になる場合があります
+"""
 
 import os
 import sys
@@ -37,13 +69,27 @@ logger = logging.getLogger(__name__)
 alpha = 4
 
 class PackPathway(torch.nn.Module):
-    """
-    Transform for converting video frames as a list of tensors.
+    """SlowFast networkのための動画フレーム変換モジュール
+    
+    このモジュールは動画フレームを2つの経路（slow pathwayとfast pathway）に分割します：
+    - slow pathway: 低フレームレートで空間的に詳細な特徴を抽出
+    - fast pathway: 高フレームレートで時間的な特徴を抽出
+    
+    Attributes:
+        alpha (int): fast pathwayとslow pathwayのフレームレート比
     """
     def __init__(self):
         super().__init__()
 
     def forward(self, frames: torch.Tensor):
+        """フレームを2つの経路に分割
+        
+        Args:
+            frames (torch.Tensor): 入力フレーム (T, C, H, W)
+        
+        Returns:
+            List[torch.Tensor]: [slow_pathway, fast_pathway]
+        """
         fast_pathway = frames
         # Perform temporal sampling from the fast pathway.
         slow_pathway = torch.index_select(
@@ -58,6 +104,19 @@ class PackPathway(torch.nn.Module):
 
 
 class VideoProcessor:
+    """動画処理とモデル推論を行うクラス
+    
+    このクラスは以下の機能を提供します：
+    1. 事前学習済みのSlowFast networkのロードと初期化
+    2. 動画の前処理（リサイズ、正規化など）
+    3. 動画セグメントの切り出し
+    4. 特徴量の抽出
+    
+    Attributes:
+        device (str): 使用するデバイス（'cuda' or 'cpu'）
+        model (nn.Module): ロードされたSlowFast network
+        transform (Compose): 動画前処理用の変換パイプライン
+    """
     def __init__(self, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
         self.device = device
         self.model = self._load_model()
@@ -76,7 +135,18 @@ class VideoProcessor:
             sys.exit(1)
 
     def _create_transform(self) -> Compose:
-        """動画前処理用のtransform作成 (256x256にリサイズ)"""
+        """動画前処理用のtransform作成
+        
+        以下の処理を順に適用します：
+        1. フレーム数の統一（32フレーム）
+        2. ピクセル値の正規化（0-1に変換）
+        3. チャネルごとの正規化
+        4. サイズの統一（256x256にリサイズ）
+        5. テンソル次元の並べ替え
+        
+        Returns:
+            Compose: 変換パイプライン
+        """
         num_frames = 32
         mean = [0.45, 0.45, 0.45]
         std = [0.225, 0.225, 0.225]
@@ -98,7 +168,17 @@ class VideoProcessor:
 
     def extract_video_segment(self, video_path: str, start_sec: float, end_sec: float, 
                             output_path: str) -> bool:
-        """動画の指定区間を切り出して保存"""
+        """動画から指定時間区間を切り出して保存
+        
+        Args:
+            video_path (str): 入力動画のパス
+            start_sec (float): 切り出し開始時間（秒）
+            end_sec (float): 切り出し終了時間（秒）
+            output_path (str): 出力ファイルパス
+        
+        Returns:
+            bool: 切り出しが成功した場合True
+        """
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -172,7 +252,14 @@ class VideoProcessor:
             return None
 
 class APTOSDataset(torch.utils.data.Dataset):
-    """APTOSデータセット"""
+    """APTOSデータセットのPyTorch実装
+    
+    特徴量とアノテーションを組み合わせてデータセットを作成します。
+    
+    Attributes:
+        features_dict (Dict[str, np.ndarray]): 動画IDをキーとする特徴量の辞書
+        annotations (pd.DataFrame): アノテーション情報のDataFrame
+    """
     def __init__(self, features_dict: Dict[str, np.ndarray], annotation_df: pd.DataFrame):
         self.features_dict = features_dict
         self.annotations = annotation_df
@@ -181,6 +268,20 @@ class APTOSDataset(torch.utils.data.Dataset):
         return len(self.annotations)
     
     def __getitem__(self, idx):
+        """データセットからサンプルを取得
+        
+        Args:
+            idx (int): サンプルのインデックス
+        
+        Returns:
+            Dict: {
+                'features': 特徴量テンソル,
+                'phase_id': フェーズID,
+                'video_id': 動画ID,
+                'start_time': 開始時間,
+                'end_time': 終了時間
+            }
+        """
         row = self.annotations.iloc[idx]
         video_id = row['video_id']
         start_time = row['start']
@@ -239,7 +340,19 @@ def extract_segments(csv_path: str, video_dir: str, output_video_dir: str):
             logger.error(f"動画セグメントの切り出しに失敗: {video_path}")
 
 def sample_balanced_data(df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
-    """各phase_idから均等にサンプリングを行う"""
+    """各フェーズから均等にサンプリング
+    
+    Args:
+        df (pd.DataFrame): 元のデータフレーム
+        n_samples (int): サンプリングする総数
+    
+    Returns:
+        pd.DataFrame: サンプリング後のデータフレーム
+    
+    注意:
+        - クラスごとのサンプル数が不足する場合は置換サンプリングを行います
+        - 総サンプル数はクラス数で割り切れる必要があります
+    """
     # phase_idごとのグループを取得
     groups = df.groupby('phase_id')
     
@@ -257,6 +370,34 @@ def sample_balanced_data(df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
     # すべてのサンプリングされたデータを結合
     return pd.concat(sampled_dfs).reset_index(drop=True)
 
+def load_excludes(excludes_file: str) -> set:
+    """除外するビデオIDのリストを読み込む
+    
+    Args:
+        excludes_file (str): 除外リストを含むテキストファイルのパス
+        
+    Returns:
+        set: 除外するビデオIDのセット
+    
+    Note:
+        テキストファイルは1行に1つのビデオIDを記載
+        空行とコメント行(#で始まる)は無視
+    """
+    if not os.path.exists(excludes_file):
+        logger.warning(f"除外リストファイルが見つかりません: {excludes_file}")
+        return set()
+        
+    try:
+        with open(excludes_file, 'r') as f:
+            # 空行とコメント行を除去し、各行をトリムしてセットに変換
+            excludes = {line.strip() for line in f 
+                       if line.strip() and not line.startswith('#')}
+        logger.info(f"除外リストを読み込みました: {len(excludes)}件")
+        return excludes
+    except Exception as e:
+        logger.error(f"除外リストの読み込みでエラー: {str(e)}")
+        return set()
+
 @cli.command()
 @click.option("--csv-path", required=True, type=click.Path(exists=True),
               help="アノテーションCSVファイルのパス")
@@ -266,16 +407,46 @@ def sample_balanced_data(df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
               help="保存するデータセットファイルのパス (デフォルト: aptos_dataset.pth)")
 @click.option("--n-samples", default=None, type=int,
               help="サンプリングする総データ数（指定しない場合は全データを使用）")
-def create_dataset(csv_path: str, video_dir: str, save_dataset: str, n_samples: int):
-    """切り出した動画から特徴量を抽出してデータセットを作成"""
+@click.option("--excludes-file", default="excludes.txt", type=click.Path(exists=True),
+              help="除外するビデオIDのリストを含むテキストファイル")
+@click.option("--intermediate-save-dir", default=None, type=click.Path(),
+              help="中間結果として各動画の特徴量を保存するディレクトリ（指定しない場合はvideo-dirを使用）")
+def create_dataset(csv_path: str, video_dir: str, save_dataset: str, 
+                   n_samples: int, excludes_file: str, intermediate_save_dir: str):
+    """動画から特徴量を抽出してデータセットを作成
+    
+    処理手順:
+    1. CSVファイルからアノテーション情報を読み込み
+    2. 除外リストに基づいてデータをフィルタリング
+    3. 必要に応じてデータをサンプリング
+    4. 各動画から特徴量を抽出／中間結果があればロード（npz形式）
+    5. トレーニング用とバリデーション用にデータを分割
+    6. データセットをファイルに保存
+    """
+    import numpy as np  # ここでnumpyを利用
     # CSVファイルの読み込み
     df = pd.read_csv(csv_path)
+    
+    # 除外リストの読み込みと適用
+    if excludes_file:
+        excludes = load_excludes(excludes_file)
+        if excludes:
+            original_len = len(df)
+            df = df[~df['video_id'].isin(excludes)]
+            filtered_len = len(df)
+            logger.info(f"除外リストを適用: {original_len - filtered_len}件のデータを除外")
     
     # サンプル数が指定されている場合、データをサンプリング
     if n_samples is not None:
         logger.info(f"データを{n_samples}サンプルにサンプリングします")
         df = sample_balanced_data(df, n_samples)
         logger.info(f"各phase_idのサンプル数:\n{df['phase_id'].value_counts()}")
+    
+    # intermediate_save_dirが指定されていなければ video_dir を利用
+    if intermediate_save_dir is None:
+        intermediate_save_dir = video_dir
+    # ディレクトリが存在しなければ作成
+    os.makedirs(intermediate_save_dir, exist_ok=True)
     
     processor = VideoProcessor()
     features_dict = {}
@@ -292,19 +463,40 @@ def create_dataset(csv_path: str, video_dir: str, save_dataset: str, n_samples: 
             logger.warning(f"動画ファイルが見つかりません: {video_path}")
             continue
 
-        logger.info(f"特徴量抽出中 ({idx + 1}/{len(df)}): {video_path}")
-
-        # 特徴量の抽出
-        features = processor.extract_features(video_path)
+        # npzファイルのパスを決定
+        npz_filename = f"{video_id}_{start_time}_{end_time}.npz"
+        npz_path = os.path.join(intermediate_save_dir, npz_filename)
         
-        if features is not None:
-            # 特徴量を辞書に保存
-            feature_key = f"{video_id}_{start_time}_{end_time}"
-            features_dict[feature_key] = features
-            logger.info(f"特徴量を抽出: {feature_key}")
+        logger.info(f"特徴量抽出中 ({idx + 1}/{len(df)}): {video_path}")
+        
+        # 既にnpzファイルがあれば、特徴量を読み込む
+        if os.path.exists(npz_path):
+            try:
+                logger.info(f"中間結果を読み込み: {npz_path}")
+                data = np.load(npz_path)
+                features = data["features"]
+            except Exception as e:
+                logger.error(f"npzファイルの読み込みに失敗: {str(e)}")
+                features = None
         else:
-            logger.error(f"特徴量の抽出に失敗: {video_path}")
-            continue
+            features = None
+        
+        # npzがなければ特徴量を抽出して保存
+        if features is None:
+            features = processor.extract_features(video_path)
+            if features is not None:
+                try:
+                    np.savez_compressed(npz_path, features=features)
+                    logger.info(f"中間結果を保存: {npz_path}")
+                except Exception as e:
+                    logger.error(f"中間結果の保存に失敗: {str(e)}")
+            else:
+                logger.error(f"特徴量の抽出に失敗: {video_path}")
+                continue
+        
+        # 辞書に保存
+        feature_key = f"{video_id}_{start_time}_{end_time}"
+        features_dict[feature_key] = features
 
     logger.info("データセットの作成を開始")
     
