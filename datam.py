@@ -10,13 +10,6 @@ import cv2
 import torch
 import numpy as np
 from torchvision.transforms import Compose, Lambda
-# from pytorchvideo.data.encoded_video import EncodedVideo
-# from pytorchvideo.transforms import (
-#     ApplyTransformToKey,
-#     UniformTemporalSubsample,
-#     ShortSideScale,
-#     Normalize,
-# )
 from torchvision.transforms._transforms_video import (
     CenterCropVideo,
     NormalizeVideo,
@@ -83,17 +76,10 @@ class VideoProcessor:
             sys.exit(1)
 
     def _create_transform(self) -> Compose:
-        """動画前処理用のtransform作成"""
-        # return Compose([
-        #     UniformTemporalSubsample(32),
-        #     ShortSideScale(256),
-        #     Normalize((0.45, 0.45, 0.45), (0.225, 0.225, 0.225))
-        # ])
-        side_size = 256
+        """動画前処理用のtransform作成 (256x256にリサイズ)"""
+        num_frames = 32
         mean = [0.45, 0.45, 0.45]
         std = [0.225, 0.225, 0.225]
-        crop_size = 256
-        num_frames = 32
         return ApplyTransformToKey(
             key="video",
             transform=Compose(
@@ -101,11 +87,11 @@ class VideoProcessor:
                     UniformTemporalSubsample(num_frames),
                     Lambda(lambda x: x/255.0),
                     NormalizeVideo(mean, std),
-                    ShortSideScale(
-                        size=side_size
-                    ),
-                    CenterCropVideo(crop_size),
-                    # PackPathway()
+                    Lambda(lambda x: torch.nn.functional.interpolate(
+                        x, size=(256, 256), mode="bilinear", align_corners=False
+                    )),
+                    Lambda(lambda x: x.permute(1, 0, 2, 3)),  # [C,T,H,W] -> [T,C,H,W]に変換
+                    # PackPathway()  # 必要に応じて有効化
                 ]
             ),
         )
@@ -157,14 +143,6 @@ class VideoProcessor:
             video = EncodedVideo.from_path(video_path)
             logger.info(f"クリップ取得")
             video_data = video.get_clip(0, video.duration)
-            # logger.info(f"テンソル取得")
-            # video_tensor = video_data["video"]
-
-            # logger.info(f"テンソル変換")
-            # [T, H, W, C] -> [C, T, H, W]に変換
-            # video_tensor = video_tensor.permute(3, 0, 1, 2)
-            # float32に変換し、[0-255]から[0-1]にスケール
-            # video_tensor = video_tensor.float() / 255.0
 
             logger.info(f"前処理")            
             # 前処理を適用
@@ -175,18 +153,19 @@ class VideoProcessor:
 
             logger.info(f'video_tensor: {video_tensor["video"].cpu().numpy().shape}')
             
-            logger.info(f"inputs変換")            
+            # logger.info(f"inputs変換")            
 
-            inputs = video_tensor["video"]
-            inputs = [i.to(self.device)[None, ...] for i in inputs]
+            # inputs = video_tensor["video"]
+            # inputs = [i.to(self.device)[None, ...] for i in inputs]
             
-            logger.info(f"model実行")            
-            with torch.no_grad():
-                features = self.model(inputs)
+            # logger.info(f"model実行")            
+            # with torch.no_grad():
+            #     features = self.model(inputs)
 
-            logger.info(f"CPUモードへ切り替え")
+            # logger.info(f"CPUモードへ切り替え")
                 
-            return features.cpu().numpy()
+            # return features.cpu().numpy()
+            return video_tensor["video"].cpu().numpy()
 
         except Exception as e:
             logger.error(f"特徴量抽出中にエラー: {str(e)}")
@@ -194,8 +173,8 @@ class VideoProcessor:
 
 class APTOSDataset(torch.utils.data.Dataset):
     """APTOSデータセット"""
-    def __init__(self, features_dir: str, annotation_df: pd.DataFrame):
-        self.features_dir = features_dir
+    def __init__(self, features_dict: Dict[str, np.ndarray], annotation_df: pd.DataFrame):
+        self.features_dict = features_dict
         self.annotations = annotation_df
         
     def __len__(self):
@@ -203,20 +182,21 @@ class APTOSDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         row = self.annotations.iloc[idx]
-        feature_path = os.path.join(self.features_dir, f"{row['video_id']}_{idx:04d}.npz")
+        video_id = row['video_id']
+        start_time = row['start']
+        end_time = row['end']
         
-        try:
-            data = np.load(feature_path)
-            return {
-                'features': torch.from_numpy(data['features']).float(),
-                'phase_id': torch.tensor(data['phase_id'], dtype=torch.long),
-                'video_id': row['video_id'],
-                'start_time': row['start'],
-                'end_time': row['end']
-            }
-        except Exception as e:
-            logger.error(f"特徴量ファイルの読み込みエラー {feature_path}: {str(e)}")
-            return None
+        # features_dictから特徴量を取得
+        feature_key = f"{video_id}_{start_time}_{end_time}"
+        features = self.features_dict[feature_key]
+        
+        return {
+            'features': torch.from_numpy(features).float(),
+            'phase_id': torch.tensor(row['phase_id'], dtype=torch.long),
+            'video_id': video_id,
+            'start_time': start_time,
+            'end_time': end_time
+        }
 
 @click.group()
 def cli():
@@ -258,55 +238,74 @@ def extract_segments(csv_path: str, video_dir: str, output_video_dir: str):
         if not processor.extract_video_segment(video_path, start_sec, end_sec, segment_path):
             logger.error(f"動画セグメントの切り出しに失敗: {video_path}")
 
+def sample_balanced_data(df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
+    """各phase_idから均等にサンプリングを行う"""
+    # phase_idごとのグループを取得
+    groups = df.groupby('phase_id')
+    
+    # 各グループから取得するサンプル数を計算
+    n_classes = len(groups)
+    samples_per_class = n_samples // n_classes
+    
+    sampled_dfs = []
+    for _, group in groups:
+        # 各クラスからサンプリング（グループサイズより多く要求された場合は置換でサンプリング）
+        replace = len(group) < samples_per_class
+        sampled = group.sample(n=samples_per_class, replace=replace)
+        sampled_dfs.append(sampled)
+    
+    # すべてのサンプリングされたデータを結合
+    return pd.concat(sampled_dfs).reset_index(drop=True)
+
 @cli.command()
 @click.option("--csv-path", required=True, type=click.Path(exists=True),
               help="アノテーションCSVファイルのパス")
 @click.option("--video-dir", required=True, type=click.Path(exists=True),
               help="切り出した動画が格納されているディレクトリ")
-@click.option("--output-feature-dir", default="output_features", type=click.Path(),
-              help="特徴量ファイルの出力先ディレクトリ (デフォルト: output_features)")
 @click.option("--save-dataset", default="aptos_dataset.pth", type=click.Path(),
               help="保存するデータセットファイルのパス (デフォルト: aptos_dataset.pth)")
-def create_dataset(csv_path: str, video_dir: str, output_feature_dir: str, save_dataset: str):
+@click.option("--n-samples", default=None, type=int,
+              help="サンプリングする総データ数（指定しない場合は全データを使用）")
+def create_dataset(csv_path: str, video_dir: str, save_dataset: str, n_samples: int):
     """切り出した動画から特徴量を抽出してデータセットを作成"""
-    os.makedirs(output_feature_dir, exist_ok=True)
-
     # CSVファイルの読み込み
     df = pd.read_csv(csv_path)
+    
+    # サンプル数が指定されている場合、データをサンプリング
+    if n_samples is not None:
+        logger.info(f"データを{n_samples}サンプルにサンプリングします")
+        df = sample_balanced_data(df, n_samples)
+        logger.info(f"各phase_idのサンプル数:\n{df['phase_id'].value_counts()}")
+    
     processor = VideoProcessor()
+    features_dict = {}
 
     # 各動画セグメントから特徴量を抽出
     for idx, row in df.iterrows():
         video_id = row["video_id"]
         start_time = row["start"]
         end_time = row["end"]
-        phase_id = int(row["phase_id"])
         
-        # video_pathの構築を修正
+        # video_pathの構築
         video_path = os.path.join(video_dir, f"{video_id}_{start_time}_{end_time}.mp4")
         if not os.path.exists(video_path):
             logger.warning(f"動画ファイルが見つかりません: {video_path}")
             continue
 
-        feature_path = os.path.join(output_feature_dir, f"{video_id}_{start_time}_{end_time}.npz")
-        logger.info(f"特徴量抽出中: {video_path}")
+        logger.info(f"特徴量抽出中 ({idx + 1}/{len(df)}): {video_path}")
 
         # 特徴量の抽出
         features = processor.extract_features(video_path)
-
-        logger.info(f"特徴量抽出終了")
         
         if features is not None:
-            # 特徴量とphase_idを保存
-            logger.info(f"特徴量保存中: {feature_path}")
-
-            np.savez(feature_path, features=features, phase_id=phase_id)
-            logger.info(f"特徴量を保存: {feature_path}")
+            # 特徴量を辞書に保存
+            feature_key = f"{video_id}_{start_time}_{end_time}"
+            features_dict[feature_key] = features
+            logger.info(f"特徴量を抽出: {feature_key}")
         else:
             logger.error(f"特徴量の抽出に失敗: {video_path}")
             continue
 
-    # データセットの作成
     logger.info("データセットの作成を開始")
     
     # DataFrameをトレーニングとバリデーションに分割
@@ -314,13 +313,14 @@ def create_dataset(csv_path: str, video_dir: str, output_feature_dir: str, save_
     val_df = df[df['split'] == 'val']
     
     # データセットの作成
-    train_dataset = APTOSDataset(output_feature_dir, train_df)
-    val_dataset = APTOSDataset(output_feature_dir, val_df)
+    train_dataset = APTOSDataset(features_dict, train_df)
+    val_dataset = APTOSDataset(features_dict, val_df)
     
     # データセットの保存
     torch.save({
-        'train_dataset': train_dataset,
-        'val_dataset': val_dataset,
+        'features_dict': features_dict,
+        'train_df': train_df,
+        'val_df': val_df,
         'num_classes': len(df['phase_id'].unique())
     }, save_dataset)
     
