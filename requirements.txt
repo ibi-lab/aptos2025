@@ -1,0 +1,7 @@
+torch
+torchvision
+opencv-python
+pandas
+click
+numpy
+git+https://github.com/facebookresearch/pytorchvideo.git
