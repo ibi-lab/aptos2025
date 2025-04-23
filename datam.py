@@ -451,10 +451,6 @@ def create_dataset(csv_path: str, video_dir: str, save_dataset: str,
             df = df[~df['video_id'].isin(excludes)]
             filtered_len = len(df)
             logger.info(f"除外リストを適用: {original_len - filtered_len}件のデータを除外")
-    else:
-        os.path.touch(excludes_file)
-        logger.info(f"除外リストファイルが存在しません: {excludes_file}")
-        logger.info(f"新しい除外リストファイルを作成しました")
     
     # サンプル数が指定されている場合、データをサンプリング
     if n_samples is not None:
@@ -547,4 +543,4 @@ def create_dataset(csv_path: str, video_dir: str, save_dataset: str,
     logger.info(f"バリデーションデータ数: {len(val_dataset)}")
 
 if __name__ == "__main__":
-    cli()
+    cli()ß
