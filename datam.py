@@ -398,6 +398,22 @@ def load_excludes(excludes_file: str) -> set:
         logger.error(f"除外リストの読み込みでエラー: {str(e)}")
         return set()
 
+def add_to_excludes(entry: str, excludes_file: str) -> None:
+    """excludes_fileにエントリを追加"""
+    with open(excludes_file, "a") as f:
+        f.write(entry + "\n")
+
+def remove_from_excludes(entry: str, excludes_file: str) -> None:
+    """excludes_fileからエントリを削除"""
+    if not os.path.exists(excludes_file):
+        return
+    with open(excludes_file, "r") as f:
+        lines = f.readlines()
+    with open(excludes_file, "w") as f:
+        for line in f:
+            if line.strip() != entry:
+                f.write(line)
+
 @cli.command()
 @click.option("--csv-path", required=True, type=click.Path(exists=True),
               help="アノテーションCSVファイルのパス")
@@ -407,14 +423,14 @@ def load_excludes(excludes_file: str) -> set:
               help="保存するデータセットファイルのパス (デフォルト: aptos_dataset.pth)")
 @click.option("--n-samples", default=None, type=int,
               help="サンプリングする総データ数（指定しない場合は全データを使用）")
-@click.option("--excludes-file", default="excludes.txt", type=click.Path(exists=True),
+@click.option("--excludes-file", default="excludes.txt", type=click.Path(),
               help="除外するビデオIDのリストを含むテキストファイル")
 @click.option("--intermediate-save-dir", default=None, type=click.Path(),
               help="中間結果として各動画の特徴量を保存するディレクトリ（指定しない場合はvideo-dirを使用）")
 def create_dataset(csv_path: str, video_dir: str, save_dataset: str, 
                    n_samples: int, excludes_file: str, intermediate_save_dir: str):
     """動画から特徴量を抽出してデータセットを作成
-    
+    （処理中のファイルはexcludes.txtに一時的に登録され、正常終了時に削除されます）
     処理手順:
     1. CSVファイルからアノテーション情報を読み込み
     2. 除外リストに基づいてデータをフィルタリング
@@ -435,6 +451,10 @@ def create_dataset(csv_path: str, video_dir: str, save_dataset: str,
             df = df[~df['video_id'].isin(excludes)]
             filtered_len = len(df)
             logger.info(f"除外リストを適用: {original_len - filtered_len}件のデータを除外")
+    else:
+        os.path.touch(excludes_file)
+        logger.info(f"除外リストファイルが存在しません: {excludes_file}")
+        logger.info(f"新しい除外リストファイルを作成しました")
     
     # サンプル数が指定されている場合、データをサンプリング
     if n_samples is not None:
@@ -456,6 +476,11 @@ def create_dataset(csv_path: str, video_dir: str, save_dataset: str,
         video_id = row["video_id"]
         start_time = row["start"]
         end_time = row["end"]
+        
+        # 動画識別子（キー）を作成
+        feature_key = f"{video_id}_{start_time}_{end_time}"
+        # 処理中のファイルをexcludes.txtに書き込み
+        add_to_excludes(feature_key, excludes_file)
         
         # video_pathの構築
         video_path = os.path.join(video_dir, f"{video_id}_{start_time}_{end_time}.mp4")
@@ -494,8 +519,9 @@ def create_dataset(csv_path: str, video_dir: str, save_dataset: str,
                 logger.error(f"特徴量の抽出に失敗: {video_path}")
                 continue
         
+        # 正常に処理が完了した動画はexcludes.txtからエントリを削除
+        remove_from_excludes(feature_key, excludes_file)
         # 辞書に保存
-        feature_key = f"{video_id}_{start_time}_{end_time}"
         features_dict[feature_key] = features
 
     logger.info("データセットの作成を開始")
