@@ -5,3 +5,4 @@ pandas
 click
 numpy
 git+https://github.com/facebookresearch/pytorchvideo.git
+joblib
